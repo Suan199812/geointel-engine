@@ -80,7 +80,11 @@ async function callGoogleGenerativeModel<T>(prompt: string, responseSchema: any)
                 responseSchema,
             },
         });
-        return JSON.parse(result.text) as T;
+        const responseText = result.text;
+        if (!responseText) {
+            throw new Error("Received an empty response from the Google Generative model.");
+        }
+        return JSON.parse(responseText) as T;
     };
     return retryWithBackoff(fn);
 }
@@ -95,6 +99,9 @@ async function callGoogleGroundedModel<T>(prompt: string): Promise<{ data: T; so
         });
 
         const responseText = result.text;
+        if (!responseText) {
+            throw new Error("Received an empty response from the Google Grounded model.");
+        }
         const sources = result.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
         const jsonMatch = responseText.match(/```json\n([\s\S]*?)\n```/);
         if (!jsonMatch || !jsonMatch[1]) throw new Error('Failed to parse JSON from grounded model response.');
@@ -137,7 +144,10 @@ async function callOpenRouterModel<T>(prompt: string, apiKey: string): Promise<{
         }
 
         const result = await response.json();
-        const responseText = result.choices[0].message.content;
+        const responseText = result.choices[0]?.message?.content;
+        if (typeof responseText !== 'string') {
+            throw new Error("Received an invalid or empty response from OpenRouter.");
+        }
         
         const sources: GroundingChunk[] = []; 
         
