@@ -1,0 +1,6 @@
+{
+  "name": "Geopolitical Intelligence Engine",
+  "description": "A Palantir-like intelligence platform that automatically extracts entities and relationships from news, visualizing them as an interactive knowledge graph to turn data into actionable intelligence. Powered by Google Gemini.",
+  "requestFramePermissions": [],
+  "prompt": ""
+}

@@ -1,0 +1,15 @@
+name = "geopolitical-intelligence-engine"
+compatibility_date = "2024-01-01"
+
+[build]
+command = "npm run build"
+output_directory = "dist"
+
+[env.production]
+name = "geopolitical-intelligence-engine"
+
+[env.production.vars]
+NODE_ENV = "production"
+
+# Note: GEMINI_API_KEY should be set in Cloudflare Pages dashboard
+# as an environment variable, not in this file 

@@ -1,0 +1,16 @@
+{
+  "short_name": "GeoIntel",
+  "name": "Geopolitical Intelligence Engine",
+  "description": "A Palantir-like intelligence platform that automatically extracts entities and relationships from news, visualizing them as an interactive knowledge graph to turn data into actionable intelligence. Powered by AI models via OpenRouter.",
+  "start_url": ".",
+  "display": "standalone",
+  "theme_color": "#0369a1",
+  "background_color": "#111827",
+  "icons": [
+    {
+      "src": "icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml"
+    }
+  ]
+}
