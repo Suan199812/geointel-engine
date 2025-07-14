@@ -1,11 +1,5 @@
 
-import { GoogleGenAI, Type } from '@google/genai';
 import type { Article, Briefing, Topic, NewsSection, TimelineEvent, UpcomingMeeting, GroundingChunk, Entity, Relationship } from '../types';
-
-// --- Initialize the Google GenAI Client ---
-const GOOGLE_API_KEY = import.meta.env.VITE_GEMINI_API_KEY || "";
-const ai = new GoogleGenAI(GOOGLE_API_KEY);
-const model = 'gemini-2.5-flash';
 
 // --- Custom Error for Quota ---
 export class QuotaExceededError extends Error {
@@ -20,21 +14,6 @@ function sleep(ms: number) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-function isQuotaError(error: any): boolean {
-    try {
-        if (error.message) {
-             const errorStr = typeof error.message === 'string' ? error.message : JSON.stringify(error.message);
-             // Check for Google's 429 error
-             if (errorStr.includes('429') && (errorStr.includes('RESOURCE_EXHAUSTED') || errorStr.includes('quota'))) {
-                 return true;
-             }
-             // Check for OpenRouter's 429 error (as a fallback)
-             if(error.status === 429) return true;
-        }
-    } catch { /* ignore parsing errors */ }
-    return false;
-}
-
 async function retryWithBackoff<T>(
     fn: () => Promise<T>,
     retries = 3,
@@ -46,12 +25,6 @@ async function retryWithBackoff<T>(
         try {
             return await fn();
         } catch (error: any) {
-            // If it's a quota error, we don't retry, we fail fast to the fallback
-            if (isQuotaError(error)) {
-                 console.warn("Quota error detected, failing fast for fallback mechanism.");
-                 throw error; // Re-throw to be caught by the main handler
-            }
-
             if (i < retries - 1) {
                 console.warn(`Retryable error received. Retrying in ${delay}ms... (Attempt ${i + 1}/${retries})`);
                 await sleep(delay + Math.random() * 500); // Add jitter
@@ -66,53 +39,12 @@ async function retryWithBackoff<T>(
 }
 
 
-// --- API Callers for Different Providers ---
-
-// Google AI SDK Caller (JSON response)
-async function callGoogleGenerativeModel<T>(prompt: string, responseSchema: any): Promise<T> {
-    const fn = async () => {
-        const result = await ai.models.generateContent({
-            model,
-            contents: prompt,
-            config: {
-                responseMimeType: 'application/json',
-                responseSchema,
-            },
-        });
-        const responseText = result.text;
-        if (!responseText) {
-            throw new Error("Received an empty response from the Google Generative model.");
-        }
-        return JSON.parse(responseText) as T;
-    };
-    return retryWithBackoff(fn);
-}
-
-// Google AI SDK Caller (Grounded)
-async function callGoogleGroundedModel<T>(prompt: string): Promise<{ data: T; sources: GroundingChunk[] }> {
-    const fn = async () => {
-        const result = await ai.models.generateContent({
-            model,
-            contents: prompt,
-            config: { tools: [{ googleSearch: {} }] },
-        });
-
-        const responseText = result.text;
-        if (!responseText) {
-            throw new Error("Received an empty response from the Google Grounded model.");
-        }
-        const sources = result.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
-        const jsonMatch = responseText.match(/```json\n([\s\S]*?)\n```/);
-        if (!jsonMatch || !jsonMatch[1]) throw new Error('Failed to parse JSON from grounded model response.');
-        
-        const jsonData = JSON.parse(jsonMatch[1]);
-        return { data: jsonData as T, sources };
-    };
-    return retryWithBackoff(fn);
-}
-
-// OpenRouter Caller (handles both grounded and non-grounded via prompt instructions)
+// --- API Caller for OpenRouter ---
 async function callOpenRouterModel<T>(prompt: string, apiKey: string): Promise<{ data: T, sources: GroundingChunk[] }> {
+    if (!apiKey) {
+        throw new Error("OpenRouter API key is not provided.");
+    }
+
     const fn = async () => {
         const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
             method: "POST",
@@ -121,13 +53,16 @@ async function callOpenRouterModel<T>(prompt: string, apiKey: string): Promise<{
                 "Content-Type": "application/json"
             },
             body: JSON.stringify({
-                model: "google/gemini-2.5-flash", 
+                model: "google/gemini-flash-1.5", 
                 messages: [{ role: "user", content: prompt }],
             })
         });
 
         if (!response.ok) {
             let errorText = `OpenRouter API request failed with status ${response.status}`;
+            if (response.status === 429) {
+                 throw new QuotaExceededError("OpenRouter API quota exceeded.");
+            }
             try {
                 const errorBody = await response.json();
                 console.error("OpenRouter API Error Body:", errorBody);
@@ -148,6 +83,7 @@ async function callOpenRouterModel<T>(prompt: string, apiKey: string): Promise<{
             throw new Error("Received an invalid or empty response from OpenRouter.");
         }
         
+        // OpenRouter API does not provide grounding sources in the same way as Google's.
         const sources: GroundingChunk[] = []; 
         
         const jsonMatch = responseText.match(/```json\n([\s\S]*?)\n```/);
@@ -199,21 +135,7 @@ INSTRUCTIONS:
 
 Ensure all data is derived directly from the content of the articles you find.`;
 
-    let result;
-    let usedFallback = false;
-    try {
-        result = await callGoogleGroundedModel<{ report: AnalysisReport }>(prompt);
-    } catch (error) {
-        if (isQuotaError(error)) {
-            console.warn("Google quota exceeded for fetchAndAnalyzeTopic. Falling back to OpenRouter.");
-            if (!openRouterApiKey) throw new QuotaExceededError("Google API quota exceeded. Please configure the OpenRouter API key to continue.");
-            result = await callOpenRouterModel<{ report: AnalysisReport }>(prompt, openRouterApiKey);
-            usedFallback = true;
-        } else {
-            throw error;
-        }
-    }
-
+    const result = await callOpenRouterModel<{ report: AnalysisReport }>(prompt, openRouterApiKey);
     const report = result.data.report || { articles: [], graph: { entities: [], relationships: [] } };
     const enrichedArticles = report.articles.map(article => ({ ...article, isAnalyzed: true }));
     const data = {
@@ -222,7 +144,7 @@ Ensure all data is derived directly from the content of the articles you find.`;
         entities: report.graph.entities || [],
         relationships: report.graph.relationships || [],
     };
-    return { data, usedFallback };
+    return { data, usedFallback: false };
 }
 
 export async function discoverAndAnalyzeMore(query: string, existingArticles: Article[], openRouterApiKey: string): Promise<{ data: Pick<NewsSection, 'articles' | 'sources' | 'entities' | 'relationships'>, usedFallback: boolean }> {
@@ -246,21 +168,7 @@ INSTRUCTIONS:
 
 Provide only fresh information.`;
 
-    let result;
-    let usedFallback = false;
-    try {
-        result = await callGoogleGroundedModel<{ report: AnalysisReport }>(prompt);
-    } catch (error) {
-        if (isQuotaError(error)) {
-            console.warn("Google quota exceeded for discoverAndAnalyzeMore. Falling back to OpenRouter.");
-            if (!openRouterApiKey) throw new QuotaExceededError("Google API quota exceeded. Please configure the OpenRouter API key.");
-            result = await callOpenRouterModel<{ report: AnalysisReport }>(prompt, openRouterApiKey);
-            usedFallback = true;
-        } else {
-            throw error;
-        }
-    }
-    
+    const result = await callOpenRouterModel<{ report: AnalysisReport }>(prompt, openRouterApiKey);
     const report = result.data.report || { articles: [], graph: { entities: [], relationships: [] } };
     const newArticles = report.articles.map(article => ({ ...article, isAnalyzed: true }));
     const data = {
@@ -269,7 +177,7 @@ Provide only fresh information.`;
         entities: report.graph.entities || [],
         relationships: report.graph.relationships || [],
     };
-    return { data, usedFallback };
+    return { data, usedFallback: false };
 }
 
 
@@ -288,24 +196,10 @@ The object should contain a "meetings" key, which is an array. Each object in th
 - focus_en / focus_zh (a brief summary)
 - involvesChina (boolean)`;
     
-    let usedFallback = false;
-    try {
-        const { data } = await callGoogleGroundedModel<{ meetings: Omit<UpcomingMeeting, 'id'>[] }>(prompt);
-        return { data: data.meetings || [], usedFallback };
-    } catch (error) {
-         if (isQuotaError(error)) {
-            console.warn("Google quota exceeded for fetchUpcomingMeetings. Falling back to OpenRouter.");
-            if (!openRouterApiKey) throw new QuotaExceededError("Google API quota exceeded. Please configure the OpenRouter API key.");
-            usedFallback = true;
-            const { data } = await callOpenRouterModel<{ meetings: Omit<UpcomingMeeting, 'id'>[] }>(prompt, openRouterApiKey);
-            return { data: data.meetings || [], usedFallback };
-        } else {
-            throw error;
-        }
-    }
+    const { data } = await callOpenRouterModel<{ meetings: Omit<UpcomingMeeting, 'id'>[] }>(prompt, openRouterApiKey);
+    return { data: data.meetings || [], usedFallback: false };
 }
 
-const briefingSchema = { type: Type.OBJECT, properties: { summary_en: { type: Type.STRING }, summary_zh: { type: Type.STRING } } };
 export async function generateDailyBriefing(articles: Article[], openRouterApiKey: string): Promise<{ data: Briefing, usedFallback: boolean }> {
     const briefingContext = articles.filter(a => a.summary_en).map(a => `- Title: ${a.title}\n  URL: ${a.url}\n  Summary: ${a.summary_en}`).join('\n\n');
     const prompt = `As a geopolitical intelligence analyst, synthesize the following article summaries into a high-level briefing.
@@ -323,24 +217,10 @@ export async function generateDailyBriefing(articles: Article[], openRouterApiKe
 **Article Summaries to Analyze:**
 ${briefingContext}`;
 
-    let usedFallback = false;
-    try {
-        const data = await callGoogleGenerativeModel<Briefing>(prompt, briefingSchema);
-        return { data, usedFallback };
-    } catch (error) {
-        if (isQuotaError(error)) {
-            console.warn("Google quota exceeded for generateDailyBriefing. Falling back to OpenRouter.");
-            if (!openRouterApiKey) throw new QuotaExceededError("Google API quota exceeded. Please configure the OpenRouter API key.");
-            usedFallback = true;
-            const { data } = await callOpenRouterModel<{summary_en: string, summary_zh: string}>(prompt, openRouterApiKey);
-            return { data, usedFallback };
-        } else {
-            throw error;
-        }
-    }
+    const { data } = await callOpenRouterModel<{summary_en: string, summary_zh: string}>(prompt, openRouterApiKey);
+    return { data, usedFallback: false };
 }
 
-const timelineSchema = { type: Type.OBJECT, properties: { events: { type: Type.ARRAY, items: { type: Type.OBJECT, properties: { date: { type: Type.STRING }, event: { type: Type.STRING } }, required: ['date', 'event'] } } } };
 export async function fetchEventTimeline(articles: Article[], openRouterApiKey: string): Promise<{ data: TimelineEvent[], usedFallback: boolean }> {
     const articleContext = articles.filter(a => a.summary_en).map(a => `- Title: ${a.title}\n  Summary: ${a.summary_en}`).join('\n\n');
     const prompt = `As an intelligence analyst, analyze the provided article summaries to extract and order key events chronologically.
@@ -354,23 +234,8 @@ export async function fetchEventTimeline(articles: Article[], openRouterApiKey: 
 **Article Summaries to Analyze:**
 ${articleContext}`;
 
-    let result;
-    let usedFallback = false;
-    try {
-        result = await callGoogleGenerativeModel<{events: TimelineEvent[]}>(prompt, timelineSchema);
-    } catch (error) {
-         if (isQuotaError(error)) {
-            console.warn("Google quota exceeded for fetchEventTimeline. Falling back to OpenRouter.");
-            if (!openRouterApiKey) throw new QuotaExceededError("Google API quota exceeded. Please configure the OpenRouter API key.");
-            usedFallback = true;
-            const { data } = await callOpenRouterModel<{events: TimelineEvent[]}>(prompt, openRouterApiKey);
-            result = data;
-        } else {
-            throw error;
-        }
-    }
-
-    const sortedEvents = (result.events || []).sort((a, b) => {
+    const { data } = await callOpenRouterModel<{events: TimelineEvent[]}>(prompt, openRouterApiKey);
+    const sortedEvents = (data.events || []).sort((a, b) => {
         try {
             const dateA = new Date(a.date);
             const dateB = new Date(b.date);
@@ -380,28 +245,14 @@ ${articleContext}`;
         } catch(e) { /* Ignore parsing errors */ }
         return 0;
     });
-    return { data: sortedEvents, usedFallback };
+    return { data: sortedEvents, usedFallback: false };
 }
 
-
-const suggestionsSchema = { type: Type.OBJECT, properties: { suggestions: { type: Type.ARRAY, items: { type: Type.STRING } } } };
 export async function getRelatedTopicSuggestions(existingTopics: Topic[], openRouterApiKey: string): Promise<{ data: string[], usedFallback: boolean }> {
     const prompt = `Based on these topics: ${existingTopics.map(t => t.query).join(', ')}, suggest 5 related, specific geopolitical topics to monitor. Respond with a JSON object.`;
-    let usedFallback = false;
-    try {
-        const data = await callGoogleGenerativeModel<{suggestions: string[]}>(prompt, suggestionsSchema);
-        return { data: data.suggestions || [], usedFallback };
-    } catch (error) {
-        if (isQuotaError(error)) {
-            console.warn("Google quota exceeded for getRelatedTopicSuggestions. Falling back to OpenRouter.");
-            if (!openRouterApiKey) throw new QuotaExceededError("Google API quota exceeded. Please configure the OpenRouter API key.");
-            usedFallback = true;
-            const { data } = await callOpenRouterModel<{suggestions: string[]}>(prompt, openRouterApiKey);
-            return { data: data.suggestions || [], usedFallback };
-        } else {
-            throw error;
-        }
-    }
+    
+    const { data } = await callOpenRouterModel<{suggestions: string[]}>(prompt, openRouterApiKey);
+    return { data: data.suggestions || [], usedFallback: false };
 }
 
 export async function getTrendingTopicSuggestions(openRouterApiKey: string): Promise<{ data: string[], usedFallback: boolean }> {
@@ -412,19 +263,7 @@ Examples: 'Texas Flooding Crisis', 'Sudan Peace Talks'. Topics must be concise s
     
 Respond with a JSON object inside a markdown code block (\`\`\`json ... \`\`\`).
 The object should contain a single key "suggestions" which is an array of 5 strings.`;
-    let usedFallback = false;
-    try {
-        const { data } = await callGoogleGroundedModel<{suggestions:string[]}>(prompt);
-        return { data: data.suggestions || [], usedFallback };
-    } catch (error) {
-         if (isQuotaError(error)) {
-            console.warn("Google quota exceeded for getTrendingTopicSuggestions. Falling back to OpenRouter.");
-            if (!openRouterApiKey) throw new QuotaExceededError("Google API quota exceeded. Please configure the OpenRouter API key.");
-            usedFallback = true;
-            const { data } = await callOpenRouterModel<{suggestions:string[]}>(prompt, openRouterApiKey);
-            return { data: data.suggestions || [], usedFallback };
-        } else {
-            throw error;
-        }
-    }
+    
+    const { data } = await callOpenRouterModel<{suggestions:string[]}>(prompt, openRouterApiKey);
+    return { data: data.suggestions || [], usedFallback: false };
 }
